@@ -113,9 +113,10 @@ async def proxy(path: str, request: Request) -> Response:
     if request.headers.get("accept") == "text/event-stream" or (body and body.get("stream")):
         # 스트리밍: 클라이언트를 제너레이터 안에서 생성해 스트림 수명과 맞춤
         full_content: list[str] = []
+        stream_usage: dict[str, int] = {}
 
         async def stream():
-            nonlocal full_content
+            nonlocal full_content, stream_usage
             async with httpx.AsyncClient(timeout=PROXY_TIMEOUT) as client:
                 async with client.stream(method, url, content=raw_body, headers=headers) as r:
                     async for chunk in r.aiter_bytes():
@@ -125,12 +126,17 @@ async def proxy(path: str, request: Request) -> Response:
                             if line.strip().startswith("data: ") and "[DONE]" not in line:
                                 payload = line.split("data: ", 1)[1].strip()
                                 data = json.loads(payload)
+                                if "usage" in data:
+                                    stream_usage = extract_usage_from_response(data)
                                 for choice in data.get("choices") or []:
                                     delta = choice.get("delta") or {}
                                     if "content" in delta and delta["content"]:
                                         full_content.append(delta["content"])
                         except Exception:
                             pass
+            if stream_usage:
+                logger.info("=== TOKEN USAGE (stream) === input=%s output=%s total=%s",
+                            stream_usage["prompt_tokens"], stream_usage["completion_tokens"], stream_usage["total_tokens"])
             if full_content:
                 response_text = "".join(full_content)
                 logger.info("=== RESPONSE PROMPT (stream) ===\n%s",
@@ -152,7 +158,7 @@ async def proxy(path: str, request: Request) -> Response:
         try:
             data = resp.json()
             usage = extract_usage_from_response(data)
-            logger.info("=== TOKEN USAGE === prompt_tokens=%s completion_tokens=%s total_tokens=%s",
+            logger.info("=== TOKEN USAGE === input=%s output=%s total=%s",
                         usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"])
             response_text = extract_response_text(data)
             logger.info("=== RESPONSE PROMPT ===\n%s", response_text)
