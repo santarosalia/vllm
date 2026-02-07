@@ -32,12 +32,27 @@ def extract_prompt_from_body(body: dict[str, Any]) -> str:
         for m in body["messages"]:
             role = m.get("role", "unknown")
             content = m.get("content")
-            if isinstance(content, str):
+            if content is None:
+                # content 없음 (tool_calls 등) -> role만이라도 표시
+                extra = ""
+                if "tool_calls" in m and m["tool_calls"]:
+                    extra = " (tool_calls)"
+                parts.append(f"[{role}] (no content){extra}")
+            elif isinstance(content, str):
                 parts.append(f"[{role}] {content}")
             elif isinstance(content, list):
-                # multimodal
-                texts = [c.get("text", str(c)) for c in content if isinstance(c, dict)]
-                parts.append(f"[{role}] " + " ".join(texts))
+                # multimodal: [{ "type": "text", "text": "..." }, ...]
+                texts = []
+                for c in content:
+                    if isinstance(c, dict):
+                        texts.append(c.get("text") or c.get("input") or str(c))
+                    else:
+                        texts.append(str(c))
+                parts.append(f"[{role}] " + " ".join(t for t in texts if t))
+                if not texts or not any(t for t in texts):
+                    parts[-1] = f"[{role}] (empty parts)"
+            else:
+                parts.append(f"[{role}] {json.dumps(content)[:500]}")
         return "\n".join(parts) if parts else json.dumps(body["messages"])
     if "prompt" in body:
         p = body["prompt"]
@@ -87,7 +102,7 @@ async def proxy(path: str, request: Request) -> Response:
     # 로깅용: 프롬프트 추출 (chat/completions, completions 등)
     if body and ("messages" in body or "prompt" in body):
         req_prompt = extract_prompt_from_body(body)
-        logger.info("=== REQUEST PROMPT ===\n%s", req_prompt[:2000] + ("..." if len(req_prompt) > 2000 else ""))
+        logger.info("=== REQUEST PROMPT ===\n%s", req_prompt)
 
     headers = dict(request.headers)
     # 호스트 제거해서 백엔드가 자신의 호스트로 받도록
@@ -119,7 +134,7 @@ async def proxy(path: str, request: Request) -> Response:
             if full_content:
                 response_text = "".join(full_content)
                 logger.info("=== RESPONSE PROMPT (stream) ===\n%s",
-                            response_text[:2000] + ("..." if len(response_text) > 2000 else ""))
+                            response_text)
 
         return StreamingResponse(
             stream(),
@@ -140,7 +155,7 @@ async def proxy(path: str, request: Request) -> Response:
             logger.info("=== TOKEN USAGE === prompt_tokens=%s completion_tokens=%s total_tokens=%s",
                         usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"])
             response_text = extract_response_text(data)
-            logger.info("=== RESPONSE PROMPT ===\n%s", response_text[:2000] + ("..." if len(response_text) > 2000 else ""))
+            logger.info("=== RESPONSE PROMPT ===\n%s", response_text)
         except Exception as e:
             logger.debug("Response log parse skip: %s", e)
 
