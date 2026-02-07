@@ -22,7 +22,7 @@ logging.basicConfig(
 
 app = FastAPI(title="vLLM Proxy", version="1.0.0")
 
-VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://localhost:8000").rstrip("/")
+VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://localhost:5678").rstrip("/")
 PROXY_TIMEOUT = float(os.getenv("PROXY_TIMEOUT", "300"))
 
 
@@ -96,13 +96,13 @@ async def proxy(path: str, request: Request) -> Response:
 
     raw_body = await request.body() if method in ("POST", "PUT", "PATCH") else None
 
-    async with httpx.AsyncClient(timeout=PROXY_TIMEOUT) as client:
-        if request.headers.get("accept") == "text/event-stream" or (body and body.get("stream")):
-            # 스트리밍 응답
-            full_content: list[str] = []
+    if request.headers.get("accept") == "text/event-stream" or (body and body.get("stream")):
+        # 스트리밍: 클라이언트를 제너레이터 안에서 생성해 스트림 수명과 맞춤
+        full_content: list[str] = []
 
-            async def stream():
-                nonlocal full_content
+        async def stream():
+            nonlocal full_content
+            async with httpx.AsyncClient(timeout=PROXY_TIMEOUT) as client:
                 async with client.stream(method, url, content=raw_body, headers=headers) as r:
                     async for chunk in r.aiter_bytes():
                         yield chunk
@@ -114,19 +114,20 @@ async def proxy(path: str, request: Request) -> Response:
                                     full_content.append(m.group(1).encode().decode("unicode_escape"))
                         except Exception:
                             pass
-                if full_content:
-                    response_text = "".join(full_content)
-                    logger.info("=== RESPONSE PROMPT (stream) ===\n%s",
-                                response_text[:2000] + ("..." if len(response_text) > 2000 else ""))
+            if full_content:
+                response_text = "".join(full_content)
+                logger.info("=== RESPONSE PROMPT (stream) ===\n%s",
+                            response_text[:2000] + ("..." if len(response_text) > 2000 else ""))
 
-            return StreamingResponse(
-                stream(),
-                status_code=200,
-                media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
-            )
+        return StreamingResponse(
+            stream(),
+            status_code=200,
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
 
-        # 비스트리밍
+    # 비스트리밍
+    async with httpx.AsyncClient(timeout=PROXY_TIMEOUT) as client:
         resp = await client.request(method, url, content=raw_body, headers=headers)
 
     # 비스트리밍 응답 로깅
