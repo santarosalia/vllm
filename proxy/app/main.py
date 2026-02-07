@@ -6,7 +6,6 @@ vLLM Proxy - FastAPI 서버
 import json
 import logging
 import os
-import re
 from typing import Any
 
 import httpx
@@ -107,11 +106,14 @@ async def proxy(path: str, request: Request) -> Response:
                     async for chunk in r.aiter_bytes():
                         yield chunk
                         try:
-                            line = chunk.decode(errors="ignore")
-                            if "data: " in line and "[DONE]" not in line:
-                                m = re.search(r'"content":"([^"]*)"', line)
-                                if m:
-                                    full_content.append(m.group(1).encode().decode("unicode_escape"))
+                            line = chunk.decode("utf-8", errors="replace")
+                            if line.strip().startswith("data: ") and "[DONE]" not in line:
+                                payload = line.split("data: ", 1)[1].strip()
+                                data = json.loads(payload)
+                                for choice in data.get("choices") or []:
+                                    delta = choice.get("delta") or {}
+                                    if "content" in delta and delta["content"]:
+                                        full_content.append(delta["content"])
                         except Exception:
                             pass
             if full_content:
