@@ -60,6 +60,28 @@ def extract_prompt_from_body(body: dict[str, Any]) -> str:
     return "(prompt not found)"
 
 
+def format_tool_calls(tool_calls: list[Any]) -> str:
+    """tool_calls 리스트를 로그용 문자열로 포맷. OpenAI 형식: id, type, function.name, function.arguments."""
+    if not tool_calls:
+        return ""
+    lines = []
+    for i, tc in enumerate(tool_calls):
+        if not isinstance(tc, dict):
+            lines.append(f"  [{i}] {tc}")
+            continue
+        tid = tc.get("id", "")
+        ttype = tc.get("type", "function")
+        fn = tc.get("function") or {}
+        name = fn.get("name", "")
+        args = fn.get("arguments", "")
+        if isinstance(args, str) and len(args) > 400:
+            args = args[:400] + "..."
+        lines.append(f"  [{i}] id={tid!r} type={ttype} function.name={name!r}")
+        if args:
+            lines.append(f"      arguments={args!r}")
+    return "\n".join(lines)
+
+
 def extract_usage_from_response(data: dict[str, Any]) -> dict[str, int]:
     """응답에서 usage(토큰 수) 추출."""
     usage = data.get("usage") or {}
@@ -103,6 +125,14 @@ async def proxy(path: str, request: Request) -> Response:
     if body and ("messages" in body or "prompt" in body):
         req_prompt = extract_prompt_from_body(body)
         logger.info("=== REQUEST PROMPT ===\n%s", req_prompt)
+        # 요청 메시지에 tool_calls 있으면 툴 정보 로그
+        if "messages" in body:
+            for m in body["messages"]:
+                tcs = m.get("tool_calls")
+                if tcs:
+                    formatted = format_tool_calls(tcs)
+                    if formatted:
+                        logger.info("=== REQUEST TOOL CALLS ===\n%s", formatted)
 
     headers = dict(request.headers)
     # 호스트 제거해서 백엔드가 자신의 호스트로 받도록
@@ -114,9 +144,10 @@ async def proxy(path: str, request: Request) -> Response:
         # 스트리밍: 클라이언트를 제너레이터 안에서 생성해 스트림 수명과 맞춤
         full_content: list[str] = []
         stream_usage: dict[str, int] = {}
+        stream_tool_calls: list[dict[str, Any]] = []
 
         async def stream():
-            nonlocal full_content, stream_usage
+            nonlocal full_content, stream_usage, stream_tool_calls
             async with httpx.AsyncClient(timeout=PROXY_TIMEOUT) as client:
                 async with client.stream(method, url, content=raw_body, headers=headers) as r:
                     async for chunk in r.aiter_bytes():
@@ -132,11 +163,33 @@ async def proxy(path: str, request: Request) -> Response:
                                     delta = choice.get("delta") or {}
                                     if "content" in delta and delta["content"]:
                                         full_content.append(delta["content"])
+                                    # 스트리밍 툴콜: delta.tool_calls는 index별로 올 수 있음
+                                    for tc in delta.get("tool_calls") or []:
+                                        if not isinstance(tc, dict):
+                                            continue
+                                        idx = tc.get("index", len(stream_tool_calls))
+                                        while len(stream_tool_calls) <= idx:
+                                            stream_tool_calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                                        cur = stream_tool_calls[idx]
+                                        if tc.get("id"):
+                                            cur["id"] = tc["id"]
+                                        if tc.get("type"):
+                                            cur["type"] = tc["type"]
+                                        fn = cur.setdefault("function", {"name": "", "arguments": ""})
+                                        if tc.get("function"):
+                                            if tc["function"].get("name"):
+                                                fn["name"] = tc["function"]["name"]
+                                            if tc["function"].get("arguments"):
+                                                fn["arguments"] = (fn.get("arguments") or "") + tc["function"]["arguments"]
                         except Exception:
                             pass
             if stream_usage:
                 logger.info("=== TOKEN USAGE (stream) === input=%s output=%s total=%s",
                             stream_usage["prompt_tokens"], stream_usage["completion_tokens"], stream_usage["total_tokens"])
+            if stream_tool_calls:
+                formatted = format_tool_calls(stream_tool_calls)
+                if formatted:
+                    logger.info("=== RESPONSE TOOL CALLS (stream) ===\n%s", formatted)
             if full_content:
                 response_text = "".join(full_content)
                 logger.info("=== RESPONSE PROMPT (stream) ===\n%s",
@@ -162,6 +215,14 @@ async def proxy(path: str, request: Request) -> Response:
                         usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"])
             response_text = extract_response_text(data)
             logger.info("=== RESPONSE PROMPT ===\n%s", response_text)
+            # 응답 message에 tool_calls 있으면 툴 정보 로그
+            choices = data.get("choices") or []
+            if choices and "message" in choices[0]:
+                tcs = (choices[0].get("message") or {}).get("tool_calls")
+                if tcs:
+                    formatted = format_tool_calls(tcs)
+                    if formatted:
+                        logger.info("=== RESPONSE TOOL CALLS ===\n%s", formatted)
         except Exception as e:
             logger.debug("Response log parse skip: %s", e)
 
